@@ -9898,25 +9898,22 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True,
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                # Never discard committed local work on divergence. Rebase it
+                # onto the fetched upstream tip; this is normally automatic
+                # and preserves feature commits across ``hermes update``.
+                print("  ⚠ Fast-forward not possible; rebasing local commits onto upstream...")
+                rebase_result = subprocess.run(
+                    git_cmd + ["pull", "--rebase", "origin", branch],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
+                if rebase_result.returncode != 0:
+                    subprocess.run(git_cmd + ["rebase", "--abort"], cwd=PROJECT_ROOT, capture_output=True)
+                    print("✗ Could not automatically rebase local commits; they were left intact.")
+                    if rebase_result.stderr.strip():
+                        print(f"  {rebase_result.stderr.strip().splitlines()[-1]}")
+                    print("  Resolve later with: git pull --rebase")
                     sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
