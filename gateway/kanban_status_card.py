@@ -179,14 +179,14 @@ def _state(
     assignee = _clean_text(_attr(task, "assignee", ""), 80)
     worker = f"@{assignee}" if assignee else "Worker"
     latest = _last_event(timeline, {
-        "review_requested", "review_rejected", "review_accepted", "crashed",
+        "review_requested", "review_rejected", "review_accepted", "blocked", "crashed",
         "timed_out", "gave_up", "reclaimed", "archived", "review_retry_scheduled",
         "review_recovered", "review_job_reconciled", "auditor_review_claimed",
         "auditor_review_spawned", "needs_auditor",
     })
     if status == "running" and current_run is not None:
         latest = _last_event(_attr(current_run, "events", ()), {
-            "review_requested", "review_rejected", "review_accepted", "crashed",
+            "review_requested", "review_rejected", "review_accepted", "blocked", "crashed",
             "timed_out", "gave_up", "reclaimed", "archived", "review_retry_scheduled",
             "review_recovered", "review_job_reconciled", "auditor_review_claimed",
             "auditor_review_spawned", "needs_auditor",
