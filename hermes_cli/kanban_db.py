@@ -140,12 +140,12 @@ def _notification_retry_delay(error: str, *, base_seconds: int, cap_seconds: int
 #                        AI agent can perform). Genuinely human-only.
 #   * ``transient``    — a flaky/temporary failure that may clear on retry.
 #
-# ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
+# ``needs_input``, ``capability`` and ``review`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "automation", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "automation", "transient", "review"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4629,6 +4629,22 @@ def request_review(
             (task_id,),
         ).fetchone()
 
+        # A rejected review is a new, bounded rework attempt. Do not allow an
+        # unchanged handoff back into the audit lane: require a concrete
+        # pointer to what changed (commit, test result, or artifact).
+        rework_evidence = None
+        if review_job_row is not None and review_job_row["status"] == "rejected":
+            rework_evidence = (
+                metadata.get("rework_evidence")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(rework_evidence, str) or len(rework_evidence.strip()) < 3:
+                raise ValueError(
+                    "review was rejected: metadata.rework_evidence is required "
+                    "before requesting another review (commit, test result, or artifact)"
+                )
+
         sql = (
             "UPDATE tasks SET status='review', result=?, completed_at=NULL, "
             "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
@@ -4682,6 +4698,8 @@ def request_review(
         if verified_cards:
             payload["verified_cards"] = verified_cards
         if isinstance(metadata, dict):
+            if rework_evidence is not None:
+                payload["rework_evidence"] = rework_evidence.strip()[:500]
             title = metadata.get("user_facing_title") or metadata.get("display_title")
             if isinstance(title, str) and title.strip():
                 payload["user_facing_title"] = title.strip()[:140]
@@ -4721,22 +4739,45 @@ def request_review(
             "UPDATE task_events SET payload = ? WHERE id = ?",
             (json.dumps(payload, ensure_ascii=False), handoff_event_id),
         )
-    _clear_failure_counter(conn, task_id)
     return True
 
 def reject_review(conn: sqlite3.Connection, task_id: str, *, reason: str) -> bool:
-    """Atomically return a review handoff to its existing implementer."""
+    """Return a review handoff for one bounded rework attempt.
+
+    A review rejection is an unsuccessful attempt. Counting it here keeps a
+    review -> ready -> worker loop behind the same circuit breaker as crashes
+    and timeouts. Once the retry budget is exhausted the task stays blocked
+    for an explicit operator decision instead of silently respawning.
+    """
     if not reason or not reason.strip():
         raise ValueError("review rejection reason is required")
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT consecutive_failures, max_retries FROM tasks WHERE id=? AND status='review'",
+            (task_id,),
+        ).fetchone()
+        if task_row is None:
+            return False
         job_row = conn.execute(
             "SELECT status, handoff_event_id FROM kanban_review_jobs WHERE task_id=?",
             (task_id,),
         ).fetchone()
+        failures = int(task_row["consecutive_failures"] or 0) + 1
+        task_limit = task_row["max_retries"]
+        effective_limit = int(task_limit) if task_limit is not None else DEFAULT_FAILURE_LIMIT
+        exhausted = failures >= effective_limit
+        next_status = "blocked" if exhausted else "ready"
         cur = conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
-            "worker_pid=NULL, completed_at=NULL WHERE id=? AND status='review'",
-            (task_id,),
+            "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL, completed_at=NULL, consecutive_failures=?, "
+            "last_failure_error=?, block_kind=? WHERE id=? AND status='review'",
+            (
+                next_status,
+                failures,
+                f"review rejected: {reason.strip()}"[:500],
+                "review" if exhausted else None,
+                task_id,
+            ),
         )
         if cur.rowcount != 1:
             return False
@@ -4752,12 +4793,27 @@ def reject_review(conn: sqlite3.Connection, task_id: str, *, reason: str) -> boo
             {
                 "reason": reason.strip()[:1000],
                 "task_previous_status": "review",
-                "task_next_status": "ready",
+                "task_next_status": next_status,
                 "review_job_previous_status": job_row["status"] if job_row else None,
                 "review_job_status_after": "rejected",
                 "handoff_event_id": int(job_row["handoff_event_id"]) if job_row and job_row["handoff_event_id"] is not None else None,
+                "failures": failures,
+                "effective_limit": effective_limit,
+                "retry_available": not exhausted,
             },
         )
+        if exhausted:
+            _append_event(
+                conn,
+                task_id,
+                "review_rework_exhausted",
+                {
+                    "reason": reason.strip()[:1000],
+                    "failures": failures,
+                    "effective_limit": effective_limit,
+                    "next_action": "operator decision required before another worker run",
+                },
+            )
     return True
 
 
@@ -6722,7 +6778,7 @@ def _worker_exit_log_details(task_id: str) -> tuple[Optional[str], Optional[str]
 
 
 def _worker_prompt_for(task: Task) -> str:
-    """Build the next worker prompt, including one protocol-only nudge."""
+    """Build the next worker prompt, including bounded recovery context."""
     if (task.last_failure_error or "").startswith(_PROTOCOL_NUDGE_MARKER):
         return (
             f"Continue kanban task {task.id}. Your previous worker process "
@@ -6730,6 +6786,15 @@ def _worker_prompt_for(task: Task) -> str:
             "Inspect the current task state, then call exactly one of "
             "kanban_complete or kanban_block before exiting. Do not claim "
             "success in prose without the lifecycle tool."
+        )
+    if (task.last_failure_error or "").startswith("review rejected: "):
+        reason = task.last_failure_error[len("review rejected: "):]
+        return (
+            f"Rework kanban task {task.id}. The auditor rejected the prior handoff: "
+            f"{reason}\n\n"
+            "Address this finding directly. Before requesting review again, provide "
+            "metadata.rework_evidence with a commit SHA, test result, or artifact path. "
+            "Do not repeat the previous handoff unchanged."
         )
     return f"work kanban task {task.id}"
 
