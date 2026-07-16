@@ -55,7 +55,10 @@ _KANBAN_DOCUMENT_SUFFIXES = frozenset({
 # surface so an upgraded gateway can re-render stale cards once without posting
 # a replacement message or repeating that edit on a later restart.
 _KANBAN_STATUS_RENDERER_VERSION = "2026-07-15.5"
-_KANBAN_ACTIVE_INDEX_RENDERER_VERSION = "2026-07-15.6"
+# Entity-only changes (such as Telegram text links) do not alter the rendered
+# text hash. Bump this version so existing durable indexes receive the new
+# entities on their next refresh instead of remaining visually stale forever.
+_KANBAN_ACTIVE_INDEX_RENDERER_VERSION = "2026-07-16.1"
 
 
 def _active_index_link_label(item: tuple[Any, ...]) -> str:
