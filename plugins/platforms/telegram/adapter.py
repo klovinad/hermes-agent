@@ -970,17 +970,22 @@ class TelegramAdapter(BasePlatformAdapter):
                 entities.append(MessageEntity(type="text_link", offset=utf16_len(content[:offset]), length=utf16_len(label_text), url=target))
         return entities
 
-    def _remember_custom_emoji_rejection(self, metadata: Optional[Dict[str, Any]]) -> None:
-        mapping = (metadata or {}).get("telegram_custom_emoji")
-        if not isinstance(mapping, dict):
-            return
-        for custom_emoji_ids in mapping.values():
-            values = custom_emoji_ids if isinstance(custom_emoji_ids, (list, tuple)) else [custom_emoji_ids]
-            for custom_emoji_id in values:
-                emoji_id = str(custom_emoji_id or "").strip()
-                if emoji_id and emoji_id not in self._rejected_custom_emoji_ids:
-                    self._rejected_custom_emoji_ids.add(emoji_id)
-                    logger.warning("[%s] Telegram rejected configured Kanban custom emoji; using Unicode fallback", self.name)
+    def _remember_custom_emoji_rejection(self, entities: list[Any], error: Exception) -> None:
+        """Quarantine one rejected entity without disabling the whole palette.
+
+        Telegram reports a malformed custom-emoji entity for the complete
+        message, not the offending id.  Marking every configured id therefore
+        made one stale emoji erase all custom presentation until restart.
+        """
+        for entity in entities:
+            emoji_id = str(getattr(entity, "custom_emoji_id", "") or "").strip()
+            if emoji_id and emoji_id not in self._rejected_custom_emoji_ids:
+                self._rejected_custom_emoji_ids.add(emoji_id)
+                logger.warning(
+                    "[%s] Telegram rejected Kanban custom emoji id=%s; retrying remaining entities: %s",
+                    self.name, emoji_id, _redact_telegram_error_text(error),
+                )
+                return
 
     @staticmethod
     def _is_custom_emoji_rejection(exc: Exception) -> bool:
@@ -4098,15 +4103,26 @@ class TelegramAdapter(BasePlatformAdapter):
                         success=False,
                         error=_redact_telegram_error_text(emoji_error),
                     )
-                self._remember_custom_emoji_rejection(metadata)
+                self._remember_custom_emoji_rejection(custom_entities, emoji_error)
+                retry_entities = self._custom_emoji_entities(content, metadata)
                 try:
                     msg = await self._send_message_with_thread_fallback(
-                        chat_id=normalize_telegram_chat_id(chat_id), text=content,
+                        chat_id=normalize_telegram_chat_id(chat_id), text=content, entities=retry_entities,
                         reply_to_message_id=reply_to_id, **thread_kwargs,
                         **self._link_preview_kwargs(), **self._notification_kwargs(metadata),
                     )
                     return SendResult(success=True, message_id=str(msg.message_id))
                 except Exception as fallback_error:
+                    if retry_entities and self._is_custom_emoji_rejection(fallback_error):
+                        try:
+                            msg = await self._send_message_with_thread_fallback(
+                                chat_id=normalize_telegram_chat_id(chat_id), text=content,
+                                reply_to_message_id=reply_to_id, **thread_kwargs,
+                                **self._link_preview_kwargs(), **self._notification_kwargs(metadata),
+                            )
+                            return SendResult(success=True, message_id=str(msg.message_id))
+                        except Exception as unicode_error:
+                            return SendResult(success=False, error=_redact_telegram_error_text(unicode_error))
                     return SendResult(success=False, error=_redact_telegram_error_text(fallback_error))
 
         try:
@@ -4522,13 +4538,23 @@ class TelegramAdapter(BasePlatformAdapter):
                             else classify_send_error(emoji_error)
                         ),
                     )
-                self._remember_custom_emoji_rejection(metadata)
+                self._remember_custom_emoji_rejection(custom_entities, emoji_error)
+                retry_entities = self._custom_emoji_entities(content, metadata)
                 try:
                     await self._bot.edit_message_text(
                         chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), text=content,
+                        entities=retry_entities,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as fallback_error:
+                    if retry_entities and self._is_custom_emoji_rejection(fallback_error):
+                        try:
+                            await self._bot.edit_message_text(
+                                chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), text=content,
+                            )
+                            return SendResult(success=True, message_id=message_id)
+                        except Exception as unicode_error:
+                            fallback_error = unicode_error
                     fallback_error_text = str(fallback_error).lower()
                     return SendResult(
                         success=False,

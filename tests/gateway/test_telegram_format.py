@@ -1148,6 +1148,19 @@ def _guest_group_message(text, *, chat_id=-100201, entities=None, reply_to_bot=F
     )
 
 
+def test_custom_emoji_rejection_keeps_unrelated_ids_available(adapter):
+    """One bad entity must not turn off every configured Kanban custom emoji."""
+    adapter._rejected_custom_emoji_ids = set()
+    entities = [
+        SimpleNamespace(custom_emoji_id="bad-id"),
+        SimpleNamespace(custom_emoji_id="good-id"),
+    ]
+
+    adapter._remember_custom_emoji_rejection(entities, RuntimeError("custom emoji rejected"))
+
+    assert adapter._rejected_custom_emoji_ids == {"bad-id"}
+
+
 def _guest_mention_entity(text, mention="@hermes_bot"):
     return SimpleNamespace(type="mention", offset=text.index(mention), length=len(mention))
 
