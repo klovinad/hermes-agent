@@ -2173,34 +2173,37 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count = 0
         self._send_path_degraded = False
 
+    def _observe_polling_request_result(self, request, generation, result):
+        """Record getUpdates progress from an observed do_request result."""
+        status_code, payload = result
+        if generation is None or not (200 <= status_code < 300):
+            return
+        try:
+            envelope = request.parse_json_payload(payload)
+        except Exception:
+            return
+        if (
+            isinstance(envelope, dict)
+            and envelope.get("ok") is True
+            and "result" in envelope
+        ):
+            self._record_polling_progress(generation)
+
     def _instrument_polling_request(self, request):
-        """Wrap one dedicated PTB getUpdates request with progress tracking."""
-        do_request = request.do_request
+        """Instrument a dedicated PTB getUpdates request without monkey-patching it."""
+        adapter = self
+        base_cls = type(request)
 
-        async def _do_request(*args, **kwargs):
-            generation = _POLLING_GENERATION_CONTEXT.get()
-            result = await do_request(*args, **kwargs)
-            status_code, payload = result
-            if generation is not None and 200 <= status_code < 300:
-                try:
-                    # Use the request's own parser so health observation agrees
-                    # exactly with PTB's authoritative response handling (e.g.
-                    # UTF-8 replacement decoding and BOM rejection).
-                    envelope = request.parse_json_payload(payload)
-                except Exception:
-                    # Instrumentation is observational: PTB still parses the
-                    # untouched payload and owns the resulting exception.
-                    pass
-                else:
-                    if (
-                        isinstance(envelope, dict)
-                        and envelope.get("ok") is True
-                        and "result" in envelope
-                    ):
-                        self._record_polling_progress(generation)
-            return result
+        class _InstrumentedPollingRequest(base_cls):
+            __slots__ = ()
 
-        request.do_request = _do_request
+            async def do_request(self, *args, **kwargs):
+                generation = _POLLING_GENERATION_CONTEXT.get()
+                result = await super().do_request(*args, **kwargs)
+                adapter._observe_polling_request_result(self, generation, result)
+                return result
+
+        request.__class__ = _InstrumentedPollingRequest
         return request
 
     async def _start_polling_once(
