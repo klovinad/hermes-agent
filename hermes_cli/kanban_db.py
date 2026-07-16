@@ -111,6 +111,11 @@ _FLOOD_CONTROL_DELAY_RE = re.compile(
     r"(?:flood_control\s*:\s*|retry\s+(?:after|in)\s+)(\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+_REWORK_COMMIT_EVIDENCE_RE = re.compile(r"^commit:\s*[0-9a-f]{7,64}\s*$", re.IGNORECASE)
+_REWORK_TEST_EVIDENCE_RE = re.compile(
+    r"^tests:\s*.+\b(?:pass|passed|successful|ok)\b", re.IGNORECASE
+)
+_REWORK_ARTIFACT_EVIDENCE_RE = re.compile(r"^artifact:\s*(?:\.?/|~?/|[A-Za-z0-9_.-]+/).+", re.IGNORECASE)
 
 
 def _notification_retry_delay(error: str, *, base_seconds: int, cap_seconds: int) -> tuple[int, bool]:
@@ -124,6 +129,18 @@ def _notification_retry_delay(error: str, *, base_seconds: int, cap_seconds: int
         return default_delay, False
     # Honour Telegram's RetryAfter verbatim (plus a one-second boundary buffer).
     return max(default_delay, int(float(match.group(1))) + 1), True
+
+
+def _is_valid_rework_evidence(value: object) -> bool:
+    """Accept a concrete, machine-checkable rework evidence declaration."""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(
+        _REWORK_COMMIT_EVIDENCE_RE.fullmatch(text)
+        or _REWORK_TEST_EVIDENCE_RE.match(text)
+        or _REWORK_ARTIFACT_EVIDENCE_RE.fullmatch(text)
+    )
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -905,6 +922,10 @@ class Task:
     # ``_record_task_failure`` for the circuit-breaker trip rule.
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
+    # Review rejections have an independent budget. They must never consume
+    # the operational crash/timeout breaker, or vice versa.
+    review_rejections: int = 0
+    review_rejection_reason: Optional[str] = None
     worker_pid: Optional[int] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
@@ -996,6 +1017,14 @@ class Task:
                 # on a DB that was never opened since pre-#20410 code ran. Keep for
                 # belt-and-suspenders safety; in practice it is dead code post-migration.
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
+            ),
+            review_rejections=(
+                int(row["review_rejections"] or 0)
+                if "review_rejections" in keys else 0
+            ),
+            review_rejection_reason=(
+                row["review_rejection_reason"]
+                if "review_rejection_reason" in keys else None
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
             last_failure_error=(
@@ -1194,6 +1223,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- The circuit breaker in _record_task_failure trips when this
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    -- Independent audit-rejection budget. Kept separate from operational
+    -- failures so one crash cannot consume a review rework attempt.
+    review_rejections     INTEGER NOT NULL DEFAULT 0,
+    review_rejection_reason TEXT,
     worker_pid           INTEGER,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
@@ -2113,6 +2146,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "UPDATE tasks SET consecutive_failures = COALESCE(spawn_failures, 0)"
             )
+    if "review_rejections" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_rejections",
+            "review_rejections INTEGER NOT NULL DEFAULT 0",
+        )
+    if "review_rejection_reason" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_rejection_reason", "review_rejection_reason TEXT"
+        )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
     if "last_failure_error" not in cols:
@@ -4570,6 +4612,7 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    _clear_review_rework_state(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
@@ -4639,10 +4682,12 @@ def request_review(
                 if isinstance(metadata, dict)
                 else None
             )
-            if not isinstance(rework_evidence, str) or len(rework_evidence.strip()) < 3:
+            if not _is_valid_rework_evidence(rework_evidence):
                 raise ValueError(
                     "review was rejected: metadata.rework_evidence is required "
-                    "before requesting another review (commit, test result, or artifact)"
+                    "before requesting another review. Use one of: "
+                    "commit:<7+ hex SHA>, tests:<command/result with passed>, "
+                    "or artifact:<path>"
                 )
 
         sql = (
@@ -4753,7 +4798,7 @@ def reject_review(conn: sqlite3.Connection, task_id: str, *, reason: str) -> boo
         raise ValueError("review rejection reason is required")
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT consecutive_failures, max_retries FROM tasks WHERE id=? AND status='review'",
+            "SELECT review_rejections FROM tasks WHERE id=? AND status='review'",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -4762,19 +4807,17 @@ def reject_review(conn: sqlite3.Connection, task_id: str, *, reason: str) -> boo
             "SELECT status, handoff_event_id FROM kanban_review_jobs WHERE task_id=?",
             (task_id,),
         ).fetchone()
-        failures = int(task_row["consecutive_failures"] or 0) + 1
-        task_limit = task_row["max_retries"]
-        effective_limit = int(task_limit) if task_limit is not None else DEFAULT_FAILURE_LIMIT
-        exhausted = failures >= effective_limit
+        review_rejections = int(task_row["review_rejections"] or 0) + 1
+        exhausted = review_rejections >= DEFAULT_REVIEW_REJECTION_LIMIT
         next_status = "blocked" if exhausted else "ready"
         cur = conn.execute(
             "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
-            "worker_pid=NULL, completed_at=NULL, consecutive_failures=?, "
-            "last_failure_error=?, block_kind=? WHERE id=? AND status='review'",
+            "worker_pid=NULL, completed_at=NULL, review_rejections=?, "
+            "review_rejection_reason=?, block_kind=? WHERE id=? AND status='review'",
             (
                 next_status,
-                failures,
-                f"review rejected: {reason.strip()}"[:500],
+                review_rejections,
+                reason.strip()[:1000],
                 "review" if exhausted else None,
                 task_id,
             ),
@@ -4797,20 +4840,33 @@ def reject_review(conn: sqlite3.Connection, task_id: str, *, reason: str) -> boo
                 "review_job_previous_status": job_row["status"] if job_row else None,
                 "review_job_status_after": "rejected",
                 "handoff_event_id": int(job_row["handoff_event_id"]) if job_row and job_row["handoff_event_id"] is not None else None,
-                "failures": failures,
-                "effective_limit": effective_limit,
+                "review_rejections": review_rejections,
+                "review_rejection_limit": DEFAULT_REVIEW_REJECTION_LIMIT,
                 "retry_available": not exhausted,
             },
         )
         if exhausted:
+            # This must be a real block event, not merely a status value: the
+            # sticky-block guard prevents a future dispatcher failure-limit
+            # configuration change from silently promoting it back to ready.
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": reason.strip()[:1000],
+                    "kind": "review",
+                    "source": "review_rework_limit",
+                },
+            )
             _append_event(
                 conn,
                 task_id,
                 "review_rework_exhausted",
                 {
                     "reason": reason.strip()[:1000],
-                    "failures": failures,
-                    "effective_limit": effective_limit,
+                    "review_rejections": review_rejections,
+                    "review_rejection_limit": DEFAULT_REVIEW_REJECTION_LIMIT,
                     "next_action": "operator decision required before another worker run",
                 },
             )
@@ -4904,6 +4960,7 @@ def accept_review(conn: sqlite3.Connection, task_id: str, *, summary: Optional[s
             payload["notification_summary"] = handoff["notification_summary"]
         _append_event(conn, task_id, "review_accepted", payload)
     _clear_failure_counter(conn, task_id)
+    _clear_review_rework_state(conn, task_id)
     recompute_ready(conn)
     _cleanup_workspace(conn, task_id)
     return True
@@ -6591,6 +6648,7 @@ def schedule_task(
 # a human can investigate. Prevents retry storms when a worker repeatedly times
 # out, crashes, or cannot spawn.
 DEFAULT_FAILURE_LIMIT = 2
+DEFAULT_REVIEW_REJECTION_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
@@ -6787,8 +6845,8 @@ def _worker_prompt_for(task: Task) -> str:
             "kanban_complete or kanban_block before exiting. Do not claim "
             "success in prose without the lifecycle tool."
         )
-    if (task.last_failure_error or "").startswith("review rejected: "):
-        reason = task.last_failure_error[len("review rejected: "):]
+    if task.review_rejection_reason:
+        reason = task.review_rejection_reason
         return (
             f"Rework kanban task {task.id}. The auditor rejected the prior handoff: "
             f"{reason}\n\n"
@@ -8043,8 +8101,21 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL WHERE id = ?",
+            (task_id,),
+        )
+
+
+def _clear_review_rework_state(conn: sqlite3.Connection, task_id: str) -> None:
+    """Clear audit-rework state only after a genuine terminal success.
+
+    Operator reclaim/reassignment can reset operational retry state, but must
+    not erase the independent review budget and reopen an audit-loop escape.
+    """
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET review_rejections = 0, review_rejection_reason = NULL "
+            "WHERE id = ?",
             (task_id,),
         )
 

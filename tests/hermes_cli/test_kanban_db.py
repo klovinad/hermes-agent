@@ -4865,7 +4865,7 @@ def test_repeated_review_reject_requires_a_fresh_handoff(
         ).fetchone()[0]
         assert kb.request_review(
             conn, tid, summary="rework is ready for another audit",
-            metadata={"rework_evidence": "commit abc1234"},
+            metadata={"rework_evidence": "commit: abc1234"},
         )
         second_handoff = conn.execute(
             "SELECT handoff_event_id FROM kanban_review_jobs WHERE task_id=?", (tid,)
@@ -4895,17 +4895,20 @@ def test_review_rework_requires_evidence_and_trips_the_retry_breaker(
         first = kb.get_task(conn, tid)
         assert first is not None
         assert first.status == "ready"
-        assert first.consecutive_failures == 1
+        assert first.consecutive_failures == 0
+        assert first.review_rejections == 1
+        assert first.review_rejection_reason == "add a deterministic test"
 
         assert kb.request_review(
             conn,
             tid,
             summary="added the deterministic test",
-            metadata={"rework_evidence": "pytest tests/test_reorder.py: 1 passed"},
+            metadata={"rework_evidence": "tests: pytest tests/test_reorder.py: 1 passed"},
         )
         after_evidence = kb.get_task(conn, tid)
         assert after_evidence is not None
-        assert after_evidence.consecutive_failures == 1
+        assert after_evidence.consecutive_failures == 0
+        assert after_evidence.review_rejections == 1
 
         assert kb.reject_review(conn, tid, reason="test still does not cover cancellation")
         final = kb.get_task(conn, tid)
@@ -4914,8 +4917,102 @@ def test_review_rework_requires_evidence_and_trips_the_retry_breaker(
     assert final is not None
     assert final.status == "blocked"
     assert final.block_kind == "review"
-    assert final.consecutive_failures == 2
+    assert final.consecutive_failures == 0
+    assert final.review_rejections == 2
     assert [event.kind for event in events].count("review_rework_exhausted") == 1
+    assert [event.kind for event in events].count("blocked") == 1
+
+
+def test_review_rework_block_is_sticky_and_independent_from_operational_failures(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    with kb.connect() as conn:
+        tid, _ = _request_review_with_workspace(conn, tmp_path)
+        # A previous worker crash must not consume the review retry budget.
+        conn.execute("UPDATE tasks SET consecutive_failures=1 WHERE id=?", (tid,))
+        assert kb.reject_review(conn, tid, reason="first audit finding")
+        first = kb.get_task(conn, tid)
+        assert first is not None
+        assert first.status == "ready"
+        assert first.consecutive_failures == 1
+        assert first.review_rejections == 1
+        assert "first audit finding" in kb._worker_prompt_for(first)
+
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="addressed the first finding",
+            metadata={"rework_evidence": "commit: deadbeef"},
+        )
+        assert kb.reject_review(conn, tid, reason="second audit finding")
+        blocked = kb.get_task(conn, tid)
+        assert blocked is not None and blocked.status == "blocked"
+        # A higher dispatcher failure limit must not re-promote an exhausted
+        # review task because its explicit blocked event is sticky.
+        assert kb.recompute_ready(conn, failure_limit=99) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        unblocked = kb.get_task(conn, tid)
+
+    assert unblocked is not None and unblocked.status == "ready"
+    assert unblocked.review_rejections == 2
+    assert unblocked.review_rejection_reason == "second audit finding"
+
+
+def test_review_rework_end_to_end_spawns_once_then_stays_blocked(
+    kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
+):
+    """Exercise the dispatcher path, not just individual state transitions."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    spawned = []
+
+    def spawn(task, workspace, board=None):
+        spawned.append((task.id, task.review_rejection_reason, kb._worker_prompt_for(task)))
+        return 4321
+
+    with kb.connect() as conn:
+        tid, _ = _request_review_with_workspace(conn, tmp_path)
+        assert kb.reject_review(conn, tid, reason="prove the cancellation path")
+        first_tick = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert [row[0] for row in first_tick.spawned] == [tid]
+        assert spawned == [
+            (tid, "prove the cancellation path", kb._worker_prompt_for(kb.get_task(conn, tid)))
+        ]
+        assert "prove the cancellation path" in spawned[0][2]
+
+        # Simulate an operational failure marker while the rework context must
+        # remain intact. The audit budget is still independent.
+        conn.execute("UPDATE tasks SET last_failure_error='worker crashed' WHERE id=?", (tid,))
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="added cancellation coverage",
+            metadata={"rework_evidence": "tests: pytest tests/test_cancel.py: 1 passed"},
+        )
+        assert kb.reject_review(conn, tid, reason="missing retry assertion")
+        second_tick = kb.dispatch_once(conn, spawn_fn=spawn)
+        final = kb.get_task(conn, tid)
+
+    assert second_tick.spawned == []
+    assert final is not None and final.status == "blocked"
+    assert final.block_kind == "review"
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    ["n/a", "commit: no", "tests: pytest tests/test_reorder.py", "artifact: no-file"],
+)
+def test_rework_evidence_rejects_unstructured_or_nonconcrete_values(
+    kanban_home, all_assignees_spawnable, tmp_path, evidence,
+):
+    with kb.connect() as conn:
+        tid, _ = _request_review_with_workspace(conn, tmp_path)
+        assert kb.reject_review(conn, tid, reason="evidence needed")
+        with pytest.raises(ValueError, match="commit:<7\\+ hex SHA>"):
+            kb.request_review(
+                conn, tid, summary="retry", metadata={"rework_evidence": evidence},
+            )
 
 
 def test_reconcile_replaces_stale_terminal_review_receipt(
