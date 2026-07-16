@@ -85,6 +85,21 @@ def test_running_card_uses_current_run_substantive_progress_clock():
     assert "old run" not in text
 
 
+def test_running_retry_keeps_auditor_feedback_state_visible():
+    """A fresh worker claim must not erase why review returned the task."""
+    current_run = CurrentRunProgress(
+        run_id=2,
+        started_at=100,
+        events=(Event(id=2, task_id="t_card", kind="heartbeat", payload=None, created_at=120, run_id=2),),
+    )
+    text = render_kanban_status_card(
+        sub={"task_id": "t_card"}, task=_task(created_at=1, started_at=1),
+        timeline=[_event("review_rejected", created_at=90)],
+        current_run=current_run, now=125,
+    )
+    assert "addressing auditor feedback" in text.lower()
+
+
 def test_running_card_clamps_explicit_human_detail_in_own_block():
     detail = "Проверяю доставку в исходную тему и готовлю понятный итог для пользователя. " * 5
     text = _card(_task(title="Проверить длинную live-деталь"), _event("heartbeat", {"note": detail}))
