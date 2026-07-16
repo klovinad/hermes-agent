@@ -89,6 +89,33 @@ agent:
         assert required in pinned
 
 
+def test_review_spawn_uses_registered_scoped_toolset(monkeypatch, tmp_path):
+    """Review workers must receive a real toolset, not a silently ignored name."""
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "auditor").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    from hermes_cli import kanban_db as kb
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    assert kb._default_spawn(
+        _make_task(kb, assignee="auditor"), str(workspace), review_only=True,
+    ) == 4242
+    assert captured["env"]["HERMES_KANBAN_REVIEW_ONLY"] == "1"
+    assert captured["cmd"][captured["cmd"].index("--toolsets") + 1] == "kanban-review"
+
+
 def test_default_spawn_never_boots_the_tui(monkeypatch, tmp_path):
     """Workers are headless: an inherited HERMES_TUI=1 (or a TUI-default
     config) must not send the quiet chat run into the Ink TUI, whose no-TTY

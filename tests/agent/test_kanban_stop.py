@@ -88,6 +88,15 @@ def test_no_nudge_after_kanban_block(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_no_nudge_after_review_decision(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {"role": "tool", "name": "kanban_accept_review", "tool_call_id": "1", "content": "accepted"},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 def test_nudge_budget_exhausted(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     assert build_kanban_stop_nudge(messages=[], attempts=2) is None

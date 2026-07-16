@@ -142,6 +142,28 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_review_worker_gets_only_review_decisions(monkeypatch, tmp_path):
+    """A review handoff cannot re-enter the implementation lifecycle."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_ONLY", "1")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    assert kanban == {
+        "kanban_show", "kanban_accept_review", "kanban_reject_review",
+        "kanban_recover_review",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -194,6 +216,32 @@ def test_show_explicit_task_id(worker_env):
     out = kt._handle_show({"task_id": other})
     d = json.loads(out)
     assert d["task"]["id"] == other
+
+
+def test_review_worker_can_accept_only_its_own_handoff(worker_env, monkeypatch):
+    """Review terminal tools are both available and task-scoped."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.request_review(conn, worker_env, summary="implementation handoff")
+        other = kb.create_task(conn, title="other review", assignee="peer")
+        assert kb.request_review(conn, other, summary="other handoff")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_ONLY", "1")
+
+    from tools import kanban_tools as kt
+    foreign = json.loads(kt._handle_accept_review({"task_id": other}))
+    assert "refusing to mutate" in foreign.get("error", "")
+    accepted = json.loads(kt._handle_accept_review({"summary": "verified"}))
+    assert accepted == {"ok": True, "task_id": worker_env, "review": "accepted"}
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "done"
+        assert kb.get_task(conn, other).status == "review"
+    finally:
+        conn.close()
 
 
 def test_list_filters_tasks(monkeypatch, worker_env):
