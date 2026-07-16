@@ -1508,6 +1508,9 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "Report meaningful progress" in prompt
     assert "failed verification" in prompt
     assert "Visual QA preflight" in prompt
+    assert "not just the first harness tried" in prompt
+    assert "NOT an automation block" in prompt
+    assert "route the evidence task to Light" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
@@ -1531,7 +1534,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_800, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 
