@@ -386,13 +386,33 @@ class TestBuildNativeContentParts:
         img.write_bytes(_png_bytes())
         parts, skipped = build_native_content_parts("", [str(img)])
         assert skipped == []
-        # Even with empty user text, we insert a neutral prompt so the turn
+        # Even with empty user text, we insert a neutral marker so the turn
         # isn't just pixels, and the path hint is appended after.
+        assert parts[0]["type"] == "text"
+        assert parts[0]["text"] == (
+            f"[image attached]\n\n[Image attached at: {img}]"
+        )
+        assert parts[1]["type"] == "image_url"
+
+    def test_whitespace_text_uses_marker(self, tmp_path: Path):
+        img = tmp_path / "cat.png"
+        img.write_bytes(_png_bytes())
+        parts, skipped = build_native_content_parts("   ", [str(img)])
+        assert skipped == []
+        assert parts[0]["type"] == "text"
+        assert parts[0]["text"] == (
+            f"[image attached]\n\n[Image attached at: {img}]"
+        )
+
+    def test_explicit_description_question_is_preserved(self, tmp_path: Path):
+        img = tmp_path / "desc.png"
+        img.write_bytes(_png_bytes())
+        parts, skipped = build_native_content_parts("What do you see in this image?", [str(img)])
+        assert skipped == []
         assert parts[0]["type"] == "text"
         assert parts[0]["text"] == (
             f"What do you see in this image?\n\n[Image attached at: {img}]"
         )
-        assert parts[1]["type"] == "image_url"
 
     def test_missing_file_is_skipped(self, tmp_path: Path):
         parts, skipped = build_native_content_parts("hi", [str(tmp_path / "missing.png")])
@@ -701,7 +721,7 @@ class TestBuildNativeContentPartsURLs:
             "", [], image_urls=["https://example.com/a.png"]
         )
         assert parts[0]["type"] == "text"
-        assert parts[0]["text"].startswith("What do you see in this image?")
+        assert parts[0]["text"].startswith("[image attached]")
 
 
 # ─── Format compatibility: transcode non-universal formats to PNG ────────────

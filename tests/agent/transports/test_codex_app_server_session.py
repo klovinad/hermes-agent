@@ -135,6 +135,23 @@ class TestTurnInputCoercion:
         ])
         assert text == "caption\n\n[image attached]"
 
+    def test_image_only_input_uses_neutral_marker(self):
+        text = _coerce_turn_input_text([
+            {"type": "image", "image_url": {"url": "file:///tmp/photo.png"}},
+            {"type": "text", "text": "   "},
+        ])
+        assert text == "[image attached]"
+
+    def test_explicit_description_question_is_preserved(self):
+        text = _coerce_turn_input_text([
+            {"type": "text", "text": "What do you see in this image?"},
+            {"type": "image", "image_url": {"url": "file:///tmp/photo.png"}},
+        ])
+        assert text == "What do you see in this image?\n\n[image attached]"
+
+    def test_no_image_and_no_text_returns_empty_turn_text(self):
+        assert _coerce_turn_input_text([]) == ""
+
 
 # ---- lifecycle ----
 

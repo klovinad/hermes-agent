@@ -294,7 +294,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
       }
 
-      submitRef.current(STARTUP_QUERY || 'What do you see in this image?')
+      submitRef.current(STARTUP_QUERY || '[image attached]')
     }, 0)
   }
 

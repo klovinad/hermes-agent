@@ -877,6 +877,45 @@ describe('usePromptActions file attachment sync', () => {
     }
   }
 
+  function imageAttachment(): ComposerAttachment {
+    return {
+      id: 'image:banana',
+      kind: 'image',
+      label: 'banana.jpg',
+      previewUrl: 'data:image/jpeg;base64,YmFuYW5h'
+    }
+  }
+
+  it('uses a neutral marker for a captionless image', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(await handle!.submitText('', { attachments: [imageAttachment()] })).toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: RUNTIME_SESSION_ID, text: '[image attached]' },
+      1_800_000
+    )
+  })
+
+  it('preserves an explicit image caption', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
+    )
+
+    expect(await handle!.submitText('What do you see?', { attachments: [imageAttachment()] })).toBe(true)
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      { session_id: RUNTIME_SESSION_ID, text: 'What do you see?' },
+      1_800_000
+    )
+  })
+
   it('uploads file bytes via file.attach on a remote gateway and submits the rewritten ref', async () => {
     // Remote gateway can't read the client-disk path, so the desktop must upload
     // the bytes and submit the workspace-relative ref the gateway hands back —

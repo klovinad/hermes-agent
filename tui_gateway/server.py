@@ -4835,7 +4835,9 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     prefix = "\n\n".join(parts)
     if prefix:
         return f"{prefix}\n\n{text}" if text else prefix
-    return text or "What do you see in this image?"
+    if image_paths:
+        return text or "[image attached]"
+    return text
 
 
 def _content_display_text(content: Any) -> str:

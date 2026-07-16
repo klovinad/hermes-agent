@@ -103,6 +103,8 @@ def _coerce_turn_input_text(user_input: Any) -> str:
     if isinstance(user_input, str):
         return user_input
     if isinstance(user_input, list):
+        if not user_input:
+            return ""
         parts: list[str] = []
         for item in user_input:
             if isinstance(item, str):
@@ -121,7 +123,7 @@ def _coerce_turn_input_text(user_input: Any) -> str:
             elif item_type in {"image", "image_url", "input_image"}:
                 parts.append("[image attached]")
         text = "\n\n".join(p for p in parts if p).strip()
-        return text or "What do you see in this image?"
+        return text or "[image attached]"
     return "" if user_input is None else str(user_input)
 
 

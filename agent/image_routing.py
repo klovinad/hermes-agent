@@ -742,7 +742,8 @@ def build_native_content_parts(
     # If at least one image attached, build a single text part that combines
     # the user's caption (or a neutral default) with one hint per image.
     if attached_paths or attached_urls:
-        base_text = text or "What do you see in this image?"
+        image_only_marker = "[image attached]"
+        base_text = text or image_only_marker
         hint_lines: List[str] = []
         hint_lines.extend(f"[Image attached at: {p}]" for p in attached_paths)
         hint_lines.extend(f"[Image attached: {u}]" for u in attached_urls)
