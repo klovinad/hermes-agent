@@ -195,7 +195,7 @@ def _state(
     if status == "archived" or latest_kind == "archived":
         return "📦", "Archived", "This task was closed in the archive."
     if latest_kind == "needs_auditor":
-        return "🔐", "Manual auditor review required", "Automatic review is unavailable."
+        return "⚠️", "Review automation paused", "A fresh review run is required; no reply is needed."
     if latest_kind == "review_retry_scheduled":
         return "⚠️", "Auditor review is restarting", "Review will be retried automatically."
     if latest_kind == "review_recovered":
@@ -230,6 +230,8 @@ def _state(
             return "⚠️", "Restarting after a temporary failure", "This is temporary; no reply is needed."
         if block_kind == "capability":
             return "🔐", "Manual help required", "A user action or access is required."
+        if block_kind == "automation":
+            return "🛠", "Automation setup blocked", "The system needs a working automation path; no reply is needed."
         return "📞", "Your reply is needed", "A reply is needed to continue."
     if status == "running":
         heartbeat_age = _age(_run_clock(current_run, timeline, "heartbeat"), now)
@@ -371,6 +373,13 @@ def _active_index_item(
     if status == "review":
         review = _last_event(timeline, {"review_requested"})
         reviewed_at = _attr(review, "created_at", None) or created_at
+        if latest_kind == "needs_auditor":
+            paused = _last_event(timeline, {"needs_auditor"})
+            paused_at = _attr(paused, "created_at", None) or reviewed_at
+            return 0, _age(paused_at, now) or 0, "warning", (
+                f"{_active_index_title('⚠️', title, status_card_url)}\n"
+                f"🔴 Review automation paused · {_compact_age(paused_at, now)}"
+            )
         return 1, _age(reviewed_at, now) or 0, "review", (
             f"{_active_index_title('🔎', title, status_card_url)}\n"
             f"🟡 In review: {format_elapsed_age(_age(reviewed_at, now) or 0)}"
@@ -407,6 +416,8 @@ def _active_index_item(
             detail = f"Temporary failure · {_compact_age(at, now)}"
         elif block_kind == "capability":
             detail = f"Manual help required · {_compact_age(at, now)}"
+        elif block_kind == "automation":
+            detail = f"Automation setup blocked · {_compact_age(at, now)}"
         else:
             detail = f"Reply needed to continue · {_compact_age(at, now)}"
         return 0, _age(at, now) or 0, "warning", f"{_active_index_title('⚠️', title, status_card_url)}\n🔴 {detail}"
