@@ -310,6 +310,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument(
+        "--corrects", default=None, metavar="BLOCKED_TASK_ID",
+        help="Explicitly mark this task as a correction for a blocked task. "
+             "When this task is done, the blocked task returns to ready.",
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -503,6 +508,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
+    p_correction = sub.add_parser(
+        "link-correction",
+        help="Link a corrective task to a blocked task; a done correction reopens it",
+    )
+    p_correction.add_argument("blocked_task_id")
+    p_correction.add_argument("corrective_task_id")
 
     # --- claim ---
     p_claim = sub.add_parser(
@@ -949,6 +960,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
+            "link-correction": _cmd_link_correction,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
@@ -1348,6 +1360,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        corrects = getattr(args, "corrects", None)
+        if corrects:
+            kb.link_correction(conn, corrects, task_id)
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
@@ -1810,6 +1825,18 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
         return 1
     print(f"Unlinked {args.parent_id} -> {args.child_id}")
+    return 0
+
+
+def _cmd_link_correction(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        kb.link_correction(conn, args.blocked_task_id, args.corrective_task_id)
+        source = kb.get_task(conn, args.blocked_task_id)
+    state = source.status if source else "unknown"
+    print(
+        f"Linked correction {args.corrective_task_id} -> {args.blocked_task_id} "
+        f"(source status={state})"
+    )
     return 0
 
 

@@ -1293,6 +1293,19 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- A corrective task is deliberately not a dependency edge: it must be able
+-- to run while the task it repairs is blocked. Once the corrective task has
+-- genuinely finished, the explicit link is allowed to reopen that source
+-- task's review circuit breaker.
+CREATE TABLE IF NOT EXISTS task_corrections (
+    corrective_task_id TEXT PRIMARY KEY,
+    blocked_task_id    TEXT NOT NULL,
+    created_at         INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_corrections_blocked
+ON task_corrections(blocked_task_id);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -3359,6 +3372,112 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return removed
 
 
+def _resume_blocked_task_from_correction(
+    conn: sqlite3.Connection, corrective_task_id: str,
+) -> Optional[str]:
+    """Reopen the explicitly repaired task, if it is still blocked.
+
+    Callers must hold ``write_txn`` and must invoke this only after the
+    corrective task reached ``done``.  This is intentionally narrower than
+    ``unblock_task``: accepting a correction is an operator/auditor-approved
+    new fact, so it clears the exhausted review-rework budget that a normal
+    manual unblock deliberately preserves.
+    """
+    relation = conn.execute(
+        "SELECT blocked_task_id FROM task_corrections WHERE corrective_task_id=?",
+        (corrective_task_id,),
+    ).fetchone()
+    if relation is None:
+        return None
+    blocked_task_id = relation["blocked_task_id"]
+    undone_parent = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status != 'done' LIMIT 1",
+        (blocked_task_id,),
+    ).fetchone()
+    new_status = "todo" if undone_parent else "ready"
+    cur = conn.execute(
+        "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+        "worker_pid=NULL, current_run_id=NULL, completed_at=NULL, "
+        "consecutive_failures=0, last_failure_error=NULL, "
+        "review_rejections=0, review_rejection_reason=NULL, block_kind=NULL "
+        "WHERE id=? AND status='blocked'",
+        (new_status, blocked_task_id),
+    )
+    if cur.rowcount != 1:
+        return None
+    _append_event(
+        conn,
+        blocked_task_id,
+        "unblocked_by_correction",
+        {
+            "corrective_task_id": corrective_task_id,
+            "status": new_status,
+            "review_rework_state_reset": True,
+        },
+    )
+    _append_event(
+        conn,
+        corrective_task_id,
+        "correction_unblocked_task",
+        {"blocked_task_id": blocked_task_id},
+    )
+    return blocked_task_id
+
+
+def link_correction(
+    conn: sqlite3.Connection, blocked_task_id: str, corrective_task_id: str,
+) -> bool:
+    """Explicitly register a task as the correction for a blocked task.
+
+    Unlike ``link_tasks``, this creates no scheduling dependency.  A completed
+    correction immediately reopens the blocked source task; otherwise the
+    same transition happens when the correction later completes or is accepted
+    by review.
+    """
+    if blocked_task_id == corrective_task_id:
+        raise ValueError("a task cannot correct itself")
+    resumed = False
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, status FROM tasks WHERE id IN (?, ?)",
+            (blocked_task_id, corrective_task_id),
+        ).fetchall()
+        found = {row["id"]: row["status"] for row in rows}
+        missing = [tid for tid in (blocked_task_id, corrective_task_id) if tid not in found]
+        if missing:
+            raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        if found[blocked_task_id] != "blocked":
+            raise ValueError(f"task {blocked_task_id} is not blocked")
+        existing = conn.execute(
+            "SELECT blocked_task_id FROM task_corrections WHERE corrective_task_id=?",
+            (corrective_task_id,),
+        ).fetchone()
+        if existing is not None and existing["blocked_task_id"] != blocked_task_id:
+            raise ValueError(
+                f"task {corrective_task_id} already corrects {existing['blocked_task_id']}"
+            )
+        if existing is None:
+            conn.execute(
+                "INSERT INTO task_corrections (corrective_task_id, blocked_task_id, created_at) "
+                "VALUES (?, ?, ?)",
+                (corrective_task_id, blocked_task_id, int(time.time())),
+            )
+            _append_event(
+                conn, corrective_task_id, "correction_linked",
+                {"blocked_task_id": blocked_task_id},
+            )
+            _append_event(
+                conn, blocked_task_id, "correction_registered",
+                {"corrective_task_id": corrective_task_id},
+            )
+        if found[corrective_task_id] == "done":
+            resumed = _resume_blocked_task_from_correction(conn, corrective_task_id) is not None
+    if resumed:
+        recompute_ready(conn)
+    return True
+
+
 def parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
     rows = conn.execute(
         "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
@@ -4586,6 +4705,7 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        _resume_blocked_task_from_correction(conn, task_id)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4959,6 +5079,7 @@ def accept_review(conn: sqlite3.Connection, task_id: str, *, summary: Optional[s
             payload["notification_key"] = handoff["notification_key"]
             payload["notification_summary"] = handoff["notification_summary"]
         _append_event(conn, task_id, "review_accepted", payload)
+        _resume_blocked_task_from_correction(conn, task_id)
     _clear_failure_counter(conn, task_id)
     _clear_review_rework_state(conn, task_id)
     recompute_ready(conn)

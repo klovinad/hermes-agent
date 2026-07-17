@@ -4962,6 +4962,53 @@ def test_review_rework_block_is_sticky_and_independent_from_operational_failures
     assert unblocked.review_rejection_reason == "second audit finding"
 
 
+def test_done_corrective_task_reopens_explicitly_linked_review_block(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        blocked, _ = _request_review_with_workspace(conn, tmp_path)
+        assert kb.reject_review(conn, blocked, reason="first audit finding")
+        assert kb.request_review(
+            conn, blocked, summary="addressed first finding",
+            metadata={"rework_evidence": "commit: deadbeef"},
+        )
+        assert kb.reject_review(conn, blocked, reason="second audit finding")
+        assert kb.get_task(conn, blocked).status == "blocked"
+
+        correction = kb.create_task(conn, title="repair audit snapshot")
+        assert kb.link_correction(conn, blocked, correction)
+        assert kb.complete_task(conn, correction, result="repair complete")
+        reopened = kb.get_task(conn, blocked)
+        events = kb.list_events(conn, blocked)
+
+    assert reopened is not None
+    assert reopened.status == "ready"
+    assert reopened.review_rejections == 0
+    assert reopened.review_rejection_reason is None
+    assert reopened.block_kind is None
+    assert any(event.kind == "unblocked_by_correction" for event in events)
+
+
+def test_accepted_existing_correction_reopens_when_linked_later(kanban_home, tmp_path):
+    with kb.connect() as conn:
+        blocked, _ = _request_review_with_workspace(conn, tmp_path)
+        assert kb.reject_review(conn, blocked, reason="first audit finding")
+        assert kb.request_review(
+            conn, blocked, summary="addressed first finding",
+            metadata={"rework_evidence": "commit: deadbeef"},
+        )
+        assert kb.reject_review(conn, blocked, reason="second audit finding")
+
+        correction_root = tmp_path / "correction"
+        correction_root.mkdir()
+        correction, _ = _request_review_with_workspace(conn, correction_root)
+        assert kb.accept_review(conn, correction, summary="correction accepted")
+        assert kb.link_correction(conn, blocked, correction)
+        reopened = kb.get_task(conn, blocked)
+
+    assert reopened is not None
+    assert reopened.status == "ready"
+    assert reopened.review_rejections == 0
+
+
 def test_review_rework_end_to_end_spawns_once_then_stays_blocked(
     kanban_home, all_assignees_spawnable, tmp_path, monkeypatch,
 ):
