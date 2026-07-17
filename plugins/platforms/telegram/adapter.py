@@ -1156,6 +1156,23 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=message_id,
             render_hash=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
         )
+        logger.info(
+            "[%s] Kanban manual refresh edited status card "
+            "(task=%s chat=%s thread=%s message=%s)",
+            self.name,
+            task_id,
+            chat_id,
+            thread_id,
+            message_id,
+        )
+
+    def _log_kanban_refresh_task_result(self, task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.warning("[%s] Kanban manual refresh task was cancelled", self.name)
+        except Exception:
+            logger.exception("[%s] Kanban manual refresh task crashed", self.name)
 
     async def _handle_kanban_refresh_callback(self, query: Any, task_id: str) -> None:
         message = getattr(query, "message", None)
@@ -1199,7 +1216,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 message_id=message_id,
             )
         )
-        task.add_done_callback(_consume_abandoned_task)
+        task.add_done_callback(self._log_kanban_refresh_task_result)
 
     def _remember_custom_emoji_rejection(self, entities: list[Any], error: Exception) -> None:
         """Quarantine one rejected entity without disabling the whole palette.
