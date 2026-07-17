@@ -767,6 +767,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # Tracks status bubbles owned by this adapter so subsequent calls with the
         # same key edit the same message instead of appending new ones (#30045).
         self._status_message_ids: Dict[tuple, str] = {}
+        self._kanban_refresh_cooldowns: Dict[tuple, float] = {}
         # A rejected custom emoji id is permanent for this process. Remember it
         # so a busy live-card does not turn one configuration error into log spam.
         self._rejected_custom_emoji_ids: set[str] = set()
@@ -972,6 +973,198 @@ class TelegramAdapter(BasePlatformAdapter):
             if label_text and target.startswith("https://") and offset >= 0:
                 entities.append(MessageEntity(type="text_link", offset=utf16_len(content[:offset]), length=utf16_len(label_text), url=target))
         return entities
+
+    def _kanban_refresh_keyboard(self, metadata: Optional[Dict[str, Any]]) -> Any:
+        """Return a one-card refresh button for Kanban status cards only."""
+        task_id = str((metadata or {}).get("telegram_kanban_refresh_task_id") or "").strip()
+        if not re.fullmatch(r"t_[A-Za-z0-9_-]{1,48}", task_id):
+            return None
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("↻ Обновить", callback_data=f"kr:{task_id}")
+        ]])
+
+    def _kanban_status_refresh_metadata(self, task_id: str, status: str, thread_id: str) -> dict[str, Any]:
+        metadata = {"telegram_kanban_refresh_task_id": task_id}
+        if thread_id:
+            metadata["thread_id"] = thread_id
+        status_metadata = self.kanban_status_metadata(status)
+        if isinstance(status_metadata, dict):
+            metadata.update(status_metadata)
+        return metadata
+
+    def _load_kanban_status_refresh_card(
+        self,
+        *,
+        task_id: str,
+        chat_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> Optional[tuple[str, dict[str, Any], str, str]]:
+        """Render the current status-card text for an exact Telegram message."""
+        from gateway.kanban_status_card import render_kanban_status_card
+        from hermes_cli import kanban_db as _kb
+
+        for board_meta in _kb.list_boards(include_archived=False):
+            board_slug = board_meta.get("slug")
+            conn = _kb.connect(board=board_slug)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT s.*, n.notifier_profile AS subscription_notifier_profile
+                      FROM kanban_status_surfaces AS s
+                      LEFT JOIN kanban_notify_subs AS n
+                        ON (n.task_id, n.platform, n.chat_id, n.thread_id) =
+                           (s.task_id, s.platform, s.chat_id, s.thread_id)
+                     WHERE s.task_id=?
+                       AND s.platform='telegram'
+                       AND s.chat_id=?
+                       AND s.message_id=?
+                       AND s.thread_id=?
+                     LIMIT 1
+                    """,
+                    (task_id, chat_id, message_id, thread_id or ""),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        """
+                        SELECT s.*, n.notifier_profile AS subscription_notifier_profile
+                          FROM kanban_status_surfaces AS s
+                          LEFT JOIN kanban_notify_subs AS n
+                            ON (n.task_id, n.platform, n.chat_id, n.thread_id) =
+                               (s.task_id, s.platform, s.chat_id, s.thread_id)
+                         WHERE s.task_id=?
+                           AND s.platform='telegram'
+                           AND s.chat_id=?
+                           AND s.message_id=?
+                         LIMIT 1
+                        """,
+                        (task_id, chat_id, message_id),
+                    ).fetchone()
+                if row is None:
+                    continue
+                sub = dict(row)
+                sub["notifier_profile"] = sub.pop("subscription_notifier_profile", None) or sub.get("notifier_profile") or ""
+                task = _kb.get_task(conn, task_id)
+                if task is None:
+                    continue
+                timeline = _kb.list_events(conn, task_id)
+                comments = _kb.list_comments(conn, task_id)
+                parents = [
+                    parent for parent_id in _kb.parent_ids(conn, task_id)
+                    if (parent := _kb.get_task(conn, parent_id)) is not None
+                ]
+                text = render_kanban_status_card(
+                    sub=sub,
+                    task=task,
+                    timeline=timeline,
+                    latest_comment=comments[-1] if comments else None,
+                    parents=parents,
+                    current_run=_kb.current_run_progress(conn, task_id),
+                    now=int(time.time()),
+                )
+                return text, sub, str(getattr(task, "status", "") or ""), str(board_slug or "")
+            finally:
+                conn.close()
+        return None
+
+    def _record_kanban_manual_refresh(
+        self,
+        *,
+        board_slug: str,
+        task_id: str,
+        chat_id: str,
+        thread_id: str,
+        message_id: str,
+        render_hash: str,
+    ) -> None:
+        from gateway.kanban_watchers import _KANBAN_STATUS_RENDERER_VERSION
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board_slug or None)
+        try:
+            now = int(time.time())
+            conn.execute(
+                """
+                UPDATE kanban_status_surfaces
+                   SET render_hash=?, renderer_version=?, last_rendered_at=?, updated_at=?,
+                       attempts=0, last_error=NULL, next_retry_at=NULL
+                 WHERE task_id=? AND platform='telegram' AND chat_id=? AND thread_id=? AND message_id=?
+                """,
+                (
+                    render_hash,
+                    _KANBAN_STATUS_RENDERER_VERSION,
+                    now,
+                    now,
+                    task_id,
+                    chat_id,
+                    thread_id or "",
+                    message_id,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def _handle_kanban_refresh_callback(self, query: Any, task_id: str) -> None:
+        message = getattr(query, "message", None)
+        if message is None:
+            await query.answer(text="Карточка не найдена.")
+            return
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        message_id = str(getattr(message, "message_id", "") or "")
+        thread_raw = getattr(message, "message_thread_id", None)
+        thread_id = str(thread_raw) if thread_raw is not None else ""
+        caller_id = str(getattr(getattr(query, "from_user", None), "id", "") or "")
+        chat = getattr(message, "chat", None)
+        chat_type = getattr(chat, "type", None)
+        user_name = getattr(getattr(query, "from_user", None), "first_name", None)
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=str(chat_type) if chat_type is not None else None,
+            thread_id=thread_id if thread_id else None,
+            user_name=user_name,
+        ):
+            await query.answer(text="⛔ Нет доступа.")
+            return
+
+        now = time.monotonic()
+        cooldown_key = (chat_id, thread_id, message_id, task_id)
+        cooldown_until = float(getattr(self, "_kanban_refresh_cooldowns", {}).get(cooldown_key, 0.0) or 0.0)
+        if cooldown_until > now:
+            wait = max(1, int(cooldown_until - now))
+            await query.answer(text=f"Подождите {wait} сек.")
+            return
+        if not hasattr(self, "_kanban_refresh_cooldowns"):
+            self._kanban_refresh_cooldowns = {}
+        self._kanban_refresh_cooldowns[cooldown_key] = now + 10.0
+
+        rendered = await asyncio.to_thread(
+            self._load_kanban_status_refresh_card,
+            task_id=task_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+        )
+        if rendered is None:
+            await query.answer(text="Карточка уже не найдена.")
+            return
+        text, sub, status, board_slug = rendered
+        metadata = self._kanban_status_refresh_metadata(task_id, status, str(sub.get("thread_id") or thread_id))
+        result = await self.edit_message(chat_id, message_id, text, finalize=False, metadata=metadata)
+        if not result.success:
+            await query.answer(text="Не удалось обновить.")
+            return
+        await asyncio.to_thread(
+            self._record_kanban_manual_refresh,
+            board_slug=board_slug,
+            task_id=task_id,
+            chat_id=chat_id,
+            thread_id=str(sub.get("thread_id") or thread_id),
+            message_id=message_id,
+            render_hash=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+        )
+        await query.answer(text="Карточка обновлена.")
 
     def _remember_custom_emoji_rejection(self, entities: list[Any], error: Exception) -> None:
         """Quarantine one rejected entity without disabling the whole palette.
@@ -4086,6 +4279,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=None)
 
         custom_entities = self._custom_emoji_entities(content, metadata)
+        refresh_keyboard = self._kanban_refresh_keyboard(metadata)
         if custom_entities:
             thread_id = self._metadata_thread_id(metadata)
             reply_to_id = self._reply_to_message_id_for_send(reply_to, metadata, reply_to_mode=self._reply_to_mode)
@@ -4097,6 +4291,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = await self._send_message_with_thread_fallback(
                     chat_id=normalize_telegram_chat_id(chat_id), text=content, entities=custom_entities,
                     reply_to_message_id=reply_to_id, **thread_kwargs,
+                    reply_markup=refresh_keyboard,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata),
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
@@ -4119,6 +4314,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     msg = await self._send_message_with_thread_fallback(
                         chat_id=normalize_telegram_chat_id(chat_id), text=content, entities=retry_entities,
                         reply_to_message_id=reply_to_id, **thread_kwargs,
+                        reply_markup=refresh_keyboard,
                         **self._link_preview_kwargs(), **self._notification_kwargs(metadata),
                     )
                     return SendResult(success=True, message_id=str(msg.message_id))
@@ -4131,6 +4327,7 @@ class TelegramAdapter(BasePlatformAdapter):
                             msg = await self._send_message_with_thread_fallback(
                                 chat_id=normalize_telegram_chat_id(chat_id), text=content,
                                 reply_to_message_id=reply_to_id, **thread_kwargs,
+                                reply_markup=refresh_keyboard,
                                 **self._link_preview_kwargs(), **self._notification_kwargs(metadata),
                             )
                             return SendResult(success=True, message_id=str(msg.message_id))
@@ -4250,6 +4447,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                reply_markup=refresh_keyboard if i == len(chunks) - 1 else None,
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -4264,6 +4462,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    reply_markup=refresh_keyboard if i == len(chunks) - 1 else None,
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
@@ -4542,11 +4741,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return flood_cooldown
 
         custom_entities = self._custom_emoji_entities(content, metadata)
+        refresh_keyboard = self._kanban_refresh_keyboard(metadata)
         if custom_entities:
             try:
                 await self._bot.edit_message_text(
                     chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id),
-                    text=content, entities=custom_entities,
+                    text=content, entities=custom_entities, reply_markup=refresh_keyboard,
                 )
                 return SendResult(success=True, message_id=message_id)
             except Exception as emoji_error:
@@ -4569,7 +4769,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     await self._bot.edit_message_text(
                         chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), text=content,
-                        entities=retry_entities,
+                        entities=retry_entities, reply_markup=refresh_keyboard,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as fallback_error:
@@ -4580,6 +4780,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         try:
                             await self._bot.edit_message_text(
                                 chat_id=normalize_telegram_chat_id(chat_id), message_id=int(message_id), text=content,
+                                reply_markup=refresh_keyboard,
                             )
                             return SendResult(success=True, message_id=message_id)
                         except Exception as unicode_error:
@@ -4652,6 +4853,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=content,
+                    reply_markup=refresh_keyboard,
                 )
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
@@ -4664,6 +4866,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=refresh_keyboard,
                 )
             except Exception as fmt_err:
                 # "Message is not modified" is a no-op, not an error
@@ -4681,6 +4884,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=normalize_telegram_chat_id(chat_id),
                     message_id=int(message_id),
                     text=_plain,
+                    reply_markup=refresh_keyboard,
                 )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -4735,6 +4939,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         chat_id=normalize_telegram_chat_id(chat_id),
                         message_id=int(message_id),
                         text=content,
+                        reply_markup=refresh_keyboard,
                     )
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
@@ -5991,6 +6196,15 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Kanban status-card manual refresh (kr:<task_id>) ---
+        if data.startswith("kr:"):
+            task_id = data.split(":", 1)[1].strip()
+            if not re.fullmatch(r"t_[A-Za-z0-9_-]{1,48}", task_id):
+                await query.answer(text="Некорректная карточка.")
+                return
+            await self._handle_kanban_refresh_callback(query, task_id)
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

@@ -119,6 +119,9 @@ def _kanban_status_route_metadata(adapter: Any, sub: dict, task_status: str) -> 
     metadata: dict[str, Any] = {}
     platform = str(sub.get("platform") or "").lower()
     if platform == "telegram":
+        task_id = str(sub.get("task_id") or "").strip()
+        if task_id:
+            metadata["telegram_kanban_refresh_task_id"] = task_id
         status_metadata = getattr(adapter, "kanban_status_metadata", None)
         if callable(status_metadata):
             resolved = status_metadata(task_status)
