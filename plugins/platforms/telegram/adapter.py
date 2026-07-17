@@ -1105,6 +1105,57 @@ class TelegramAdapter(BasePlatformAdapter):
         finally:
             conn.close()
 
+    async def _refresh_kanban_card_message(
+        self,
+        *,
+        task_id: str,
+        chat_id: str,
+        thread_id: str,
+        message_id: str,
+    ) -> None:
+        rendered = await asyncio.to_thread(
+            self._load_kanban_status_refresh_card,
+            task_id=task_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            message_id=message_id,
+        )
+        if rendered is None:
+            logger.warning(
+                "[%s] Kanban manual refresh could not find exact status card "
+                "(task=%s chat=%s thread=%s message=%s)",
+                self.name,
+                task_id,
+                chat_id,
+                thread_id,
+                message_id,
+            )
+            return
+        text, sub, status, board_slug = rendered
+        metadata = self._kanban_status_refresh_metadata(task_id, status, str(sub.get("thread_id") or thread_id))
+        result = await self.edit_message(chat_id, message_id, text, finalize=False, metadata=metadata)
+        if not result.success:
+            logger.warning(
+                "[%s] Kanban manual refresh edit failed "
+                "(task=%s chat=%s thread=%s message=%s): %s",
+                self.name,
+                task_id,
+                chat_id,
+                thread_id,
+                message_id,
+                getattr(result, "error", None),
+            )
+            return
+        await asyncio.to_thread(
+            self._record_kanban_manual_refresh,
+            board_slug=board_slug,
+            task_id=task_id,
+            chat_id=chat_id,
+            thread_id=str(sub.get("thread_id") or thread_id),
+            message_id=message_id,
+            render_hash=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
+        )
+
     async def _handle_kanban_refresh_callback(self, query: Any, task_id: str) -> None:
         message = getattr(query, "message", None)
         if message is None:
@@ -1138,39 +1189,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not hasattr(self, "_kanban_refresh_cooldowns"):
             self._kanban_refresh_cooldowns = {}
         self._kanban_refresh_cooldowns[cooldown_key] = now + 10.0
-        try:
-            await query.answer(text="Обновляю карточку.")
-        except Exception:
-            pass
-
-        rendered = await asyncio.to_thread(
-            self._load_kanban_status_refresh_card,
-            task_id=task_id,
-            chat_id=chat_id,
-            thread_id=thread_id,
-            message_id=message_id,
+        await query.answer(text="Обновляю карточку.")
+        task = asyncio.create_task(
+            self._refresh_kanban_card_message(
+                task_id=task_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                message_id=message_id,
+            )
         )
-        if rendered is None:
-            await query.answer(text="Карточка уже не найдена.")
-            return
-        text, sub, status, board_slug = rendered
-        metadata = self._kanban_status_refresh_metadata(task_id, status, str(sub.get("thread_id") or thread_id))
-        result = await self.edit_message(chat_id, message_id, text, finalize=False, metadata=metadata)
-        if not result.success:
-            try:
-                await query.answer(text="Не удалось обновить.")
-            except Exception:
-                pass
-            return
-        await asyncio.to_thread(
-            self._record_kanban_manual_refresh,
-            board_slug=board_slug,
-            task_id=task_id,
-            chat_id=chat_id,
-            thread_id=str(sub.get("thread_id") or thread_id),
-            message_id=message_id,
-            render_hash=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
-        )
+        task.add_done_callback(_consume_abandoned_task)
 
     def _remember_custom_emoji_rejection(self, entities: list[Any], error: Exception) -> None:
         """Quarantine one rejected entity without disabling the whole palette.
