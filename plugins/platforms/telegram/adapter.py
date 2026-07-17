@@ -1138,6 +1138,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not hasattr(self, "_kanban_refresh_cooldowns"):
             self._kanban_refresh_cooldowns = {}
         self._kanban_refresh_cooldowns[cooldown_key] = now + 10.0
+        try:
+            await query.answer(text="Обновляю карточку.")
+        except Exception:
+            pass
 
         rendered = await asyncio.to_thread(
             self._load_kanban_status_refresh_card,
@@ -1153,7 +1157,10 @@ class TelegramAdapter(BasePlatformAdapter):
         metadata = self._kanban_status_refresh_metadata(task_id, status, str(sub.get("thread_id") or thread_id))
         result = await self.edit_message(chat_id, message_id, text, finalize=False, metadata=metadata)
         if not result.success:
-            await query.answer(text="Не удалось обновить.")
+            try:
+                await query.answer(text="Не удалось обновить.")
+            except Exception:
+                pass
             return
         await asyncio.to_thread(
             self._record_kanban_manual_refresh,
@@ -1164,7 +1171,6 @@ class TelegramAdapter(BasePlatformAdapter):
             message_id=message_id,
             render_hash=__import__("hashlib").sha256(text.encode("utf-8")).hexdigest(),
         )
-        await query.answer(text="Карточка обновлена.")
 
     def _remember_custom_emoji_rejection(self, entities: list[Any], error: Exception) -> None:
         """Quarantine one rejected entity without disabling the whole palette.

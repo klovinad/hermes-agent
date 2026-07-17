@@ -126,7 +126,7 @@ def _compact_elapsed(age: int | None) -> str:
 
 def _updated_at_line(now: int) -> str:
     """Human-visible render time; makes a stalled status surface obvious."""
-    return f"🕒 Updated: {datetime.fromtimestamp(now).astimezone().strftime('%H:%M')}"
+    return f"🕒 Updated: {datetime.fromtimestamp(now).astimezone().strftime('%H:%M:%S')}"
 
 
 def _first_timestamp(timeline: list[Any], kinds: set[str], fallback: Any = None) -> Any:
