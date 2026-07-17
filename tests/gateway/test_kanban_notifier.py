@@ -1766,6 +1766,8 @@ def test_active_task_index_private_dm_topic_never_pins_and_reuses_one_message_af
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     kb.init_db()
+    from gateway.topic_anchors import record_topic_anchor
+    record_topic_anchor("telegram", "114874376", "1515141", "anchor-1")
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="Личный топик без pin", assignee="heavy")
         kb.add_notify_sub(
@@ -1798,6 +1800,9 @@ def test_active_task_indexes_keep_private_dm_topics_separate_without_pins(tmp_pa
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     kb.init_db()
+    from gateway.topic_anchors import record_topic_anchor
+    record_topic_anchor("telegram", "114874376", "1515141", "anchor-1")
+    record_topic_anchor("telegram", "114874376", "1515142", "anchor-2")
     with kb.connect() as conn:
         first = kb.create_task(conn, title="Первый личный топик", assignee="heavy")
         second = kb.create_task(conn, title="Второй личный топик", assignee="heavy")

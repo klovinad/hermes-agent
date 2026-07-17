@@ -10436,8 +10436,9 @@ def list_due_active_task_indexes(
     rows = conn.execute(
         "SELECT * FROM kanban_active_task_indexes WHERE message_id IS NOT NULL "
         "AND (lease_expires IS NULL OR lease_expires <= ?) "
+        "AND (next_retry_at IS NULL OR next_retry_at <= ?) "
         "AND (renderer_version != ? OR last_rendered_at IS NULL OR last_rendered_at <= ?)",
-        (now, renderer_version, now - STATUS_SURFACE_REFRESH_SECONDS),
+        (now, now, renderer_version, now - STATUS_SURFACE_REFRESH_SECONDS),
     ).fetchall()
     return [dict(row) for row in rows]
 

@@ -116,6 +116,8 @@ def test_active_index_flood_control_honors_telegram_retry_after(tmp_path, monkey
         )
     assert state is not None
     assert state["next_retry_at"] >= now + 3600
+    with kb.connect() as conn:
+        assert kb.list_due_active_task_indexes(conn, renderer_version="test", now=now) == []
 
 
 def test_claim_status_surface_recover_parked_blocks_repeat_of_same_stuck_message(tmp_path, monkeypatch):

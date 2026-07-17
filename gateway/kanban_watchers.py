@@ -1254,6 +1254,20 @@ class GatewayKanbanWatchersMixin:
         if not callable(getattr(adapter, "pin_message", None)):
             return 0
         items = await asyncio.to_thread(self._kanban_active_index_items, lane)
+        # Historic index receipts are retained for recovery, but an empty lane
+        # must never create background Telegram traffic during a renderer bump.
+        if not items:
+            return 0
+        thread_id = str(lane.get("thread_id") or "")
+        # A private topic has no safe synthetic destination. Wait for a real
+        # inbound message to provide its reply anchor instead of retrying a
+        # Bot API request that the adapter must refuse.
+        if (
+            _is_telegram_private_topic_lane(lane.get("chat_id"), thread_id)
+            and thread_id != "1"
+            and not _get_topic_anchor("telegram", str(lane["chat_id"]), thread_id)
+        ):
+            return 0
         now = int(time.time())
         text = render_kanban_active_task_index(items, now=now)
         metadata = _kanban_active_index_route_metadata(adapter, lane, items)

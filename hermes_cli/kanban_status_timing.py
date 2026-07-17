@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 
-STATUS_SURFACE_REFRESH_SECONDS = 15
+STATUS_SURFACE_REFRESH_SECONDS = 60
 _MINUTE_SECONDS = 60
 
 
